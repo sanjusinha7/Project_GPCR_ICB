@@ -1,0 +1,287 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+# Setting the Source Folder
+```{r, setup, include=FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = '/Users/sinhas8/Project_GPCR_ICB/')
+```
+<!-- Custom Functions require -->
+```{r}
+source('Tools/myCustom_functions.R')
+```
+<!-- Preprocess an input GPCR gene list -->
+```{r}
+GPCR_list=read.csv('Data/GPCR_list.csv')
+GPCR_list=sapply(strsplit(GPCR_list$Symbol, split = '\\('), function(x) x[1])
+GPCR_list=gsub(' ','',GPCR_list)
+```
+<!-- Libraries and other data requried -->
+```{r}
+# Libraries require
+require('svglite')
+require('cowplot')
+require('data.table')
+require('ggplot2')
+require('ggpubr')
+require(ggrepel)
+require(plyr)
+require(statar)
+require('survminer')
+require('survival')
+require('pROC')
+require(tidyr)
+
+# Expression profile of all CD8 single cells
+Keren_CD8_scRNA_ICB=fread(file = 'Data/Keren_Cell2018_data/tpm_all_scp.txt')
+# Metadata for the above dataset
+metaData=fread(file = 'Data/Keren_Cell2018_data/cells_all_scp_meta.txt')
+
+# Preprocessing required 
+GPCR_ICB_CD8_cohort1=Keren_CD8_scRNA_ICB[na.omit(match(GPCR_list, Keren_CD8_scRNA_ICB[[1]])),]
+geneNames=GPCR_ICB_CD8_cohort1[[1]]
+GPCR_ICB_CD8_cohort1=GPCR_ICB_CD8_cohort1[,-1]
+metaData=metaData[-1,]
+id2remove=colnames(GPCR_ICB_CD8_cohort1)[grep('DN_DP',metaData$response)]
+GPCR_ICB_CD8_cohort1=GPCR_ICB_CD8_cohort1[,!id2remove, with=F]
+metaData=metaData[-grep('DN_DP',metaData$response),]
+```
+<!-- Figure 1 -->
+<!-- GPRC protein expresion FC in cells from ICB responders vs non-responders -->
+```{r}
+GPCR_respvsexp_list=lapply(1:length(geneNames), 
+       function(x)
+         data.frame(Exp=unlist(GPCR_ICB_CD8_cohort1[x,]),
+                    GeneName=geneNames[x],
+                    resp=factor(metaData$response) ))
+GPCR_respvsnonresp=sapply(GPCR_respvsexp_list, function(x)
+  c(wilcox.test(x[,1] ~ x$resp)$p.value,
+    aggregate(Exp ~ resp, x, mean)[2,2]/
+      aggregate(Exp ~ resp, x, mean)[1,2]))
+keyCandidates=c('PTGER2', 'PTGER4', 'ADRB1',
+                     'ADRB2', 'ADORA2A', 'GPR65', 'GLP1R')
+GPCR_respvsnonresp=data.frame(t(GPCR_respvsnonresp), row.names = geneNames)
+colnames(GPCR_respvsnonresp)=c('P', 'FC')
+GPCR_respvsnonresp$geneNames=''
+GPCR_respvsnonresp$geneNames[na.omit(match(keyCandidates, rownames(GPCR_respvsnonresp)))]=
+  keyCandidates[!is.na(match(keyCandidates, rownames(GPCR_respvsnonresp)))]
+# Write the GPCR_respvsnonresp
+write.csv(GPCR_respvsnonresp, 'Data/GPCR_respvsnonresp.csv')
+fig1A<-ggplot(GPCR_respvsnonresp[GPCR_respvsnonresp$geneNames!='',],
+              aes(y= -log(P, 10),
+                  x= log(FC, 2)) )+
+  geom_point(aes(color= P<0.05 ))+
+  theme_bw(base_size = 20)+
+  geom_label_repel(aes(label=geneNames))
+fig1A
+
+fig1B <- ggplot(GPCR_respvsnonresp) +
+  geom_point(aes(y= -log(P, 10),x= log(FC, 2), color= geneNames!=''))+
+  geom_point(data=subset(GPCR_respvsnonresp, geneNames != '') ,
+             aes(y= -log(P, 10),x= log(FC, 2), color= geneNames!=''))+
+  theme_bw(base_size = 20)+
+  theme(legend.position = 'none')
+fig1B
+
+fig1_Complete=ggarrange(fig1A, fig1B, common.legend = T, ncol = 2)
+ggsave(plot=fig1_Complete, filename = 'Results/Figure1.pdf', width = 10, height = 5)
+ggsave(plot=fig1_Complete, filename = 'Results/Figure1.svg', width = 10, height = 5)
+```
+<!-- Preprocessing required for patient level information -->
+```{r}
+infunc_expression=GPCR_ICB_CD8_cohort1
+rownames(infunc_expression)=geneNames
+df2plot=data.frame(tmed_complex=colMeans(infunc_expression),
+                   t(infunc_expression),
+                   resp=metaData$response,
+                   therapy=metaData$therapy,
+                   prePost=metaData$prepost,
+                   survival_days=metaData$survival_days,
+                   status=metaData$status)
+df2plot$survival_days=as.numeric(as.character(df2plot$survival_days))
+df2plot$patient=metaData$patient
+df2plot=df2plot[,-1]
+columns_with_GOI=grep('X',colnames(df2plot), ignore.case = T)
+
+# Mean expression across all CD8 cells from a patient;
+# We Computed this for each paitent
+df2plot_patientLevel=cbind(aggregate(df2plot[,columns_with_GOI],
+                                     list(df2plot[,length(columns_with_GOI)+6]), mean),
+                           aggregate(df2plot[,-c(columns_with_GOI, 
+                                                 length(columns_with_GOI)+6)],
+                                     list(df2plot[,length(columns_with_GOI)+6]), unique)[,-1])
+df2plot_patientLevel_df=df2plot_patientLevel
+df2plot_patientLevel_df$status=factor(df2plot_patientLevel_df$status)
+levels(df2plot_patientLevel_df$status)=c('1', '2')
+df2plot_patientLevel_df$status=as.numeric(df2plot_patientLevel_df$status)
+```
+<!-- Figure 2: Compute ROC-AUC of stratifying responders vs non-responders-->
+```{r}
+# Identify columns which are our genes (they have X in the beginning)
+columns_with_GOI=grep('X',colnames(df2plot_patientLevel), ignore.case = T)
+# ROC for each GPCR
+roc_list= data.frame(geneNames, 
+                     AUC=sapply(columns_with_GOI, function(x) 
+                       roc(df2plot_patientLevel$resp,
+                                  df2plot_patientLevel[,x] )$auc))
+roc_list_key_candidates=roc_list[na.omit(match(keyCandidates, roc_list$geneNames)),]
+write.csv(roc_list_key_candidates, 'Data/roc_list_key_candidates.csv')
+fig2A <- ggplot(roc_list_key_candidates, aes(y=AUC, x=reorder(geneNames, AUC)))+
+    geom_bar(stat='identity')+
+    theme_bw(base_size = 15)+
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+    labs(x='Candidate GPCRs',
+         y='AUC (Predictive power to identify\n responders from non-responder)')+
+    geom_hline(yintercept = 0.5, linetype='dotted', color='blue', size=2)
+fig2A
+ggsave(plot=fig2A, filename = 'Results/Figure2A.pdf')
+ggsave(plot=fig2A, filename = 'Results/Figure2A.svg')
+```
+<!-- Compute a dysfunction score -->
+```{r}
+dysfunctional_geneset=c('LAG3', 'HAVCR2', 'PDCD1', 'PTMS', 'FAM3C', 'IFNG', 'AKAP5',
+                        'CD7', 'PHLDA1', 'ENTPD1', 'SNAP47', 'TNS3', 'CXCL13', 'RDH10',
+                        'DGKH', 'KIR2DL4', 'LYST', 'MIR155HG', 'RAB27A','CSF1',
+                        'CTLA4', 'TNFRSF9', 'CD27', 'CCL3', 'ITGAE', 'PAG1', 'TNFRSF1B',
+                        'GALNT1', 'GBP2', 'MYO7A')
+df_dysfunctional_geneset=data.frame(dysfunctional_geneset)
+dysfunc_ICB_CD8_cohort1=Keren_CD8_scRNA_ICB[Keren_CD8_scRNA_ICB[[1]]
+                                                 %in% dysfunctional_geneset,]
+geneNames_dysfunc=dysfunc_ICB_CD8_cohort1[[1]]
+dysfunc_ICB_CD8_cohort1=dysfunc_ICB_CD8_cohort1[,-1]
+dysfunc_ICB_CD8_cohort1=dysfunc_ICB_CD8_cohort1[,!id2remove, with=F]
+df2plot$dysfunc_activity=colMeans(dysfunc_ICB_CD8_cohort1)
+```
+<!-- Plot figure 3-->
+<!-- compute correlation with dysfunction -->
+```{r}
+columns_with_GOI=grep('X',colnames(df2plot), ignore.case = T)
+columns_with_dysfunc_activity=grep('dysfunc_activity',colnames(df2plot), ignore.case = T)
+columns_with_patient_info=grep('patient',colnames(df2plot), ignore.case = T)
+
+df2plot_patientLevel=cbind(aggregate(df2plot[,c(columns_with_GOI,
+                                                columns_with_dysfunc_activity)], 
+                                     list(df2plot[,columns_with_patient_info]), mean),
+                           aggregate(df2plot[,-c(columns_with_GOI,
+                                                columns_with_dysfunc_activity,
+                                                columns_with_patient_info)],
+                                     list(df2plot[,columns_with_patient_info]), unique)[,-1])
+df2plot_patientLevel_df=df2plot_patientLevel
+df2plot_patientLevel_df$status=factor(df2plot_patientLevel_df$status)
+levels(df2plot_patientLevel_df$status)=c('1', '2')
+df2plot_patientLevel_df$status=as.numeric(df2plot_patientLevel_df$status)
+
+columns_with_GOI=grep('X',colnames(df2plot_patientLevel_df), ignore.case = F)
+df2plot_patientLevel_df[,columns_with_GOI]
+correlation_with_dysfunction=data.frame(t(apply(df2plot_patientLevel_df[,columns_with_GOI], 2, function(x)
+  unlist(cor.test(df2plot_patientLevel_df$dysfunc_activity, x, method='spearman')[c(3, 4)]) )))
+rownames(correlation_with_dysfunction)=geneNames
+
+correlation_with_dysfunction$geneNames=''
+correlation_with_dysfunction$geneNames[
+  na.omit(match(keyCandidates, rownames(correlation_with_dysfunction)))]=
+  keyCandidates[!is.na(match(keyCandidates, rownames(correlation_with_dysfunction)))]
+fig3A<-ggplot(correlation_with_dysfunction[correlation_with_dysfunction$geneNames!='',],
+              aes(y= -log(p.value, 10),
+                  x= estimate.rho) )+
+  geom_point(aes(color= p.value<0.05 ))+
+  theme_bw(base_size = 20)+
+  geom_label_repel(aes(label=geneNames))
+write.csv(correlation_with_dysfunction[,1:2], 'Data/correlation_with_dysfunction.csv')
+
+fig3B <- ggplot(correlation_with_dysfunction, 
+                aes(y= -log(p.value, 10),
+                  x= estimate.rho)) +
+  geom_point(aes(y= -log(p.value, 10),
+                  x= estimate.rho,  color= geneNames!=''))+
+  geom_point(data=subset(correlation_with_dysfunction, geneNames != '') ,
+             aes(y= -log(p.value, 10),x= estimate.rho, color= geneNames!=''))+
+  theme_bw(base_size = 20)+
+  theme(legend.position = 'none')+
+  geom_label_repel(aes(label=geneNames))
+
+fig3_Complete=ggarrange(fig3A, fig3B, common.legend = T, ncol = 2)
+ggsave(plot=fig3_Complete,filename = 'Results/Figure3.pdf', width = 10, height = 5)
+ggsave(plot=fig3_Complete,filename = 'Results/Figure3.svg', width = 10, height = 5)
+```
+<!-- Incorporate the GPCR family informations -->
+```{r}
+family_ann=readxl::read_xlsx('Data/393 couplings IUPHAR only.xlsx')
+family_ann_list=apply(family_ann[,-(1:2)], 2, function(x) family_ann$GPCR[x=='PC'])
+lapply(family_ann_list, function(x)
+  na.omit(match(x, rownames(correlation_with_dysfunction) ) ))
+df2plot_pathway_score=data.frame(sapply(family_ann_list, function(x)
+  mean(correlation_with_dysfunction$estimate.rho[na.omit(match(x, rownames(correlation_with_dysfunction) ))]) ))
+colnames(df2plot_pathway_score)=c('Mean_Correlation')
+df2plot_pathway_score$Pathway=rownames(df2plot_pathway_score)
+figure5A <- ggplot(df2plot_pathway_score, aes(x=reorder(Pathway, Mean_Correlation), y=Mean_Correlation)) +
+    geom_segment( aes(xend=Pathway, yend=0)) +
+    geom_point( size=4, color="orange") +
+    theme_bw(base_size = 15)+
+  labs(y='Mean Pathway correlation\n with Dysfunction Score', x='Pathway')+
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=0.5))
+# Changes to write
+colnames(df2plot_pathway_score)[1]= "Mean_Correlation with Dysfunction Score"
+write.csv(df2plot_pathway_score, 'Data/figure5A_data.csv')
+ggsave(figure5A, filename = 'Results/figure5A.pdf', width = 3, height = 4)
+write.csv(family_ann_list$GNAS, 'Data/GNAS_genes.csv', quote = F, row.names = F)
+```
+<!-- Preprocessing for Figure 6 -->
+<!-- Mean GNAS-family expression in each CD8 cell-->
+```{r}
+tSNE_CD8_scp=read.csv('Data/tSNE_CD8_scp.txt', sep = '\t')
+tSNE_CD8_scp$resp=metaData$response[match(tSNE_CD8_scp$NAME, metaData$NAME)]
+GNAS_expression=as.data.frame(Keren_CD8_scRNA_ICB[na.omit(match(family_ann_list$GNAS, Keren_CD8_scRNA_ICB[[1]])),])
+GNAS_expression_mean=colMeans(GNAS_expression[,-1])
+tSNE_CD8_scp$GNAS_expression_mean=GNAS_expression_mean[
+  match(tSNE_CD8_scp$NAME, names(GNAS_expression_mean))]
+```
+<!-- plot_tsne; Figure 6 -->
+```{r}
+myhead(tSNE_CD8_scp)
+tSNE_CD8_scp=tSNE_CD8_scp[-1,]
+tSNE_CD8_scp$X=as.numeric(tSNE_CD8_scp$X)
+tSNE_CD8_scp$Y=as.numeric(tSNE_CD8_scp$Y)
+tSNE_CD8_scp$GNAS_expression_mean=as.numeric(tSNE_CD8_scp$GNAS_expression_mean)
+head(tSNE_CD8_scp$Y)
+
+plot_tsne_1 <- ggplot(tSNE_CD8_scp, aes(x=X, y=Y, color=resp))+
+  geom_point(size=0.2)+
+  theme_bw(base_size = 12)+
+  theme(legend.position='top')+
+  labs(x='', y='')
+plot_tsne_2 <- ggplot(tSNE_CD8_scp, aes(x=X, y=Y, color=range01(rank(GNAS_expression_mean)) ))+
+  geom_point(size=0.2)+
+  theme_bw(base_size = 12)+
+  theme(legend.position='top')+
+  labs(x='', y='', color='GNAS\nexpression')+
+  scale_colour_gradientn(colours = c("#F8766D",'lightgrey' ,"#00BFC4"))
+plot_grid(plot_tsne_1, plot_tsne_2)
+ggsave(plot_grid(plot_tsne_1, plot_tsne_2), filename = 'Results/figure6.pdf', width = 8, height = 4)
+```
+
+```{r}
+# Identify columns which have genes (they start with X)
+colnames(df2plot_patientLevel)[grep('X',colnames(df2plot_patientLevel))]=geneNames
+df2plot_patientLevel_keycand=cbind(df2plot_patientLevel[,c(na.omit(match(keyCandidates,colnames(df2plot_patientLevel))))],
+                                   resp=df2plot_patientLevel[,'resp'])
+
+df2plot_patientLevel_keycand_long=gather(df2plot_patientLevel_keycand, geneName, exp, PTGER2:GPR65, factor_key=TRUE)
+figure7A <- ggplot(df2plot_patientLevel_keycand_long,
+                   aes(x=resp, fill=resp, y=exp))+
+  geom_boxplot()+
+    facet_wrap(.~geneName)+
+    theme_bw(base_size = 15)+
+  labs(y='log2(TPM+1)', x='')+
+  stat_compare_means(label = 'p', label.y.npc = 0.75)
+write.csv(df2plot_patientLevel_keycand_long,'Data/Figure7A_data.csv')
+ggsave(figure7A,
+       filename = 'Results/figure7A.pdf',
+       width = 6, height = 6)
+```
+
